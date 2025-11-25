@@ -1,0 +1,177 @@
+name: MongoDB Backup Validation
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Daily at 3 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate-backups:
+    name: Validate MongoDB Backups
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check S3 Backup Bucket Exists
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          if aws s3 ls "s3://${BUCKET_NAME}" > /dev/null 2>&1; then
+            echo "✅ Backup bucket exists: ${BUCKET_NAME}"
+          else
+            echo "❌ Backup bucket not found: ${BUCKET_NAME}"
+            exit 1
+          fi
+
+      - name: Check Latest Backup
+        id: check_backup
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          TODAY=$(date +%Y-%m-%d)
+          YESTERDAY=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d)
+          
+          echo "Checking for backups on ${TODAY} or ${YESTERDAY}..."
+          
+          # Check if today's backup exists
+          if aws s3 ls "s3://${BUCKET_NAME}/backups/${TODAY}/" > /dev/null 2>&1; then
+            echo "✅ Backup for ${TODAY} found"
+            echo "backup_date=${TODAY}" >> $GITHUB_OUTPUT
+            echo "backup_found=true" >> $GITHUB_OUTPUT
+          elif aws s3 ls "s3://${BUCKET_NAME}/backups/${YESTERDAY}/" > /dev/null 2>&1; then
+            echo "✅ Backup for ${YESTERDAY} found"
+            echo "backup_date=${YESTERDAY}" >> $GITHUB_OUTPUT
+            echo "backup_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ No recent backup found"
+            echo "backup_found=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Validate Backup Size
+        if: steps.check_backup.outputs.backup_found == 'true'
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          BACKUP_DATE="${{ steps.check_backup.outputs.backup_date }}"
+          
+          SIZE=$(aws s3 ls "s3://${BUCKET_NAME}/backups/${BACKUP_DATE}/" --recursive --summarize | grep "Total Size" | awk '{print $3}')
+          
+          if [ -z "$SIZE" ]; then
+            echo "⚠️ Could not determine backup size"
+            SIZE=0
+          fi
+          
+          echo "Backup size: ${SIZE} bytes"
+          
+          if [ "$SIZE" -gt 1000 ]; then
+            echo "✅ Backup size is adequate: ${SIZE} bytes"
+          else
+            echo "⚠️ Backup size seems too small: ${SIZE} bytes"
+            exit 1
+          fi
+
+      - name: List Backup Contents
+        if: steps.check_backup.outputs.backup_found == 'true'
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          BACKUP_DATE="${{ steps.check_backup.outputs.backup_date }}"
+          
+          echo "=== Backup Files ==="
+          aws s3 ls "s3://${BUCKET_NAME}/backups/${BACKUP_DATE}/" --recursive
+
+      - name: Test Bucket Public Access (Security Validation)
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          
+          echo "Testing public read access (as per exercise requirement)..."
+          
+          # This should succeed as per exercise requirements (intentional misconfiguration)
+          if curl -f "https://${BUCKET_NAME}.s3.amazonaws.com/" 2>/dev/null; then
+            echo "⚠️ Bucket is publicly accessible (as per exercise requirement)"
+            echo "This is an intentional misconfiguration for the Wiz exercise"
+          else
+            echo "ℹ️ Bucket does not allow public listing via direct URL"
+          fi
+
+      - name: Check Backup Encryption
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          
+          # Check bucket encryption configuration
+          echo "Checking bucket encryption..."
+          aws s3api get-bucket-encryption --bucket "${BUCKET_NAME}" || echo "⚠️ No encryption configuration found"
+
+      - name: Verify Backup Retention
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          
+          # Count backups
+          BACKUP_COUNT=$(aws s3 ls "s3://${BUCKET_NAME}/backups/" | wc -l)
+          echo "Total backup folders: ${BACKUP_COUNT}"
+          
+          if [ "$BACKUP_COUNT" -gt 7 ]; then
+            echo "⚠️ More than 7 days of backups found. Consider implementing retention policy."
+          fi
+
+      - name: Create Issue on Backup Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '❌ MongoDB Backup Validation Failed',
+              body: `MongoDB backup validation failed on ${new Date().toISOString()}.
+              
+              **Details:**
+              - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              - Please check the backup process and ensure backups are running correctly.
+              
+              **Action Required:**
+              1. Verify MongoDB backup cron job is running
+              2. Check EC2 instance connectivity
+              3. Verify S3 bucket permissions
+              4. Review backup logs`,
+              labels: ['backup', 'mongodb', 'critical', 'infrastructure']
+            })
+
+  backup-integrity-check:
+    name: Backup Integrity Check
+    runs-on: ubuntu-latest
+    needs: validate-backups
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download Sample Backup
+        run: |
+          BUCKET_NAME="${{ secrets.BACKUP_BUCKET_NAME }}"
+          TODAY=$(date +%Y-%m-%d)
+          
+          # Create temp directory
+          mkdir -p /tmp/backup-test
+          
+          # Try to download a sample file
+          aws s3 cp "s3://${BUCKET_NAME}/backups/${TODAY}/" /tmp/backup-test/ --recursive || echo "Could not download backup files"
+
+      - name: Verify Backup Format
+        run: |
+          echo "Checking backup file formats..."
+          ls -lah /tmp/backup-test/ || echo "No files to check"
+          
+          # Check for common MongoDB backup formats
+          if ls /tmp/backup-test/*.bson 2>/dev/null || ls /tmp/backup-test/*.json 2>/dev/null; then
+            echo "✅ MongoDB backup files found"
+          else
+            echo "⚠️ No recognized MongoDB backup files found"
+          fi

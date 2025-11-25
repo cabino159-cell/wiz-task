@@ -1,0 +1,340 @@
+name: Application Build & Deploy
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - '**.go'
+      - 'Dockerfile'
+      - 'assets/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'k8s/**'
+      - '.github/workflows/2-app-build-deploy.yml'
+  pull_request:
+    branches: ['main']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  GO_VERSION: '1.19'
+  
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  pull-requests: write
+
+jobs:
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Go Mod Verify
+        run: go mod verify
+
+      - name: Go Mod Tidy Check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Go Tests
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.out
+          flags: unittests
+
+  sast-scanning:
+    name: SAST Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: '-fmt sarif -out gosec-results.sarif ./...'
+
+      - name: Upload Gosec results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec-results.sarif
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/golang
+            p/jwt
+            p/mongodb
+
+  dependency-scan:
+    name: Dependency Vulnerability Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run Nancy (Sonatype)
+        run: |
+          go list -json -m all | docker run --rm -i sonatypecommunity/nancy:latest sleuth
+
+  build-container:
+    name: Build & Scan Container Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, sast-scanning, dependency-scan]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=Tasky
+            org.opencontainers.image.description=Todo application for Wiz Exercise
+            org.opencontainers.image.vendor=WizExercise
+
+      - name: Create wizexercise.txt file
+        run: |
+          echo "Name: ${{ github.actor }}" > wizexercise.txt
+          echo "Date: $(date)" >> wizexercise.txt
+          echo "Exercise: Wiz Technical Exercise v4" >> wizexercise.txt
+          echo "Repository: ${{ github.repository }}" >> wizexercise.txt
+          echo "Commit SHA: ${{ github.sha }}" >> wizexercise.txt
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Run Grype vulnerability scanner
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          fail-build: false
+          severity-cutoff: high
+
+      - name: Docker Scout CVE Scanning
+        uses: docker/scout-action@v1
+        if: github.event_name != 'pull_request'
+        with:
+          command: cves
+          image: ${{ steps.meta.outputs.tags }}
+          only-severities: critical,high
+          exit-code: false
+
+  verify-container:
+    name: Verify Container Contents
+    runs-on: ubuntu-latest
+    needs: build-container
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and verify wizexercise.txt
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "=== Contents of wizexercise.txt ==="
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest cat /app/wizexercise.txt
+          echo "✅ wizexercise.txt file verified in container"
+
+  deploy-kubernetes:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [build-container, verify-container]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Verify kubectl connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace tasky-app --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create/Update Kubernetes Secret
+        run: |
+          kubectl create secret generic tasky-secrets \
+            --from-literal=mongodb-uri='${{ secrets.MONGODB_URI }}' \
+            --from-literal=secret-key='${{ secrets.SECRET_KEY }}' \
+            --namespace=tasky-app \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          # Update image in deployment
+          sed -i "s|IMAGE_PLACEHOLDER|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest|g" k8s/deployment.yaml
+          
+          # Apply Kubernetes manifests
+          kubectl apply -f k8s/ --namespace=tasky-app
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/tasky-deployment --namespace=tasky-app --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods --namespace=tasky-app
+          echo "=== Services ==="
+          kubectl get services --namespace=tasky-app
+          echo "=== Ingress ==="
+          kubectl get ingress --namespace=tasky-app
+
+      - name: Get application URL
+        id: get-url
+        run: |
+          INGRESS_URL=$(kubectl get ingress tasky-ingress --namespace=tasky-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          echo "app-url=${INGRESS_URL}" >> $GITHUB_OUTPUT
+          echo "Application URL: https://${INGRESS_URL}"
+
+      - name: Run smoke tests
+        run: |
+          INGRESS_URL=$(kubectl get ingress tasky-ingress --namespace=tasky-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [ -n "$INGRESS_URL" ] && [ "$INGRESS_URL" != "pending" ]; then
+            sleep 30
+            curl -f http://${INGRESS_URL} || echo "Application not yet accessible"
+          else
+            echo "Ingress URL not ready yet"
+          fi
+
+  runtime-security-scan:
+    name: Runtime Security Scan
+    runs-on: ubuntu-latest
+    needs: deploy-kubernetes
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      - name: Run Kubesec scan
+        run: |
+          kubectl get deployment tasky-deployment --namespace=tasky-app -o yaml | \
+          docker run -i kubesec/kubesec:v2 scan /dev/stdin
+
+      - name: Check Pod Security Standards
+        run: |
+          kubectl label namespace tasky-app pod-security.kubernetes.io/enforce=baseline --overwrite
+          kubectl label namespace tasky-app pod-security.kubernetes.io/warn=restricted --overwrite

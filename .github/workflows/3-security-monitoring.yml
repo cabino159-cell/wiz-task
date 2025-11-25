@@ -1,0 +1,134 @@
+name: Continuous Security Monitoring
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  container-image-scan:
+    name: Scan Latest Container Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy scan on latest image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  kubernetes-security-audit:
+    name: Kubernetes Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+      - name: Run kube-bench
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job.yaml
+          sleep 60
+          kubectl logs -l app=kube-bench -n default
+
+      - name: Run Polaris audit
+        run: |
+          kubectl apply -f https://github.com/FairwindsOps/polaris/releases/latest/download/dashboard.yaml
+          kubectl port-forward --namespace polaris svc/polaris-dashboard 8080:80 &
+          sleep 10
+          curl http://localhost:8080/health
+
+  infrastructure-drift-detection:
+    name: Terraform Drift Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+
+      - name: Detect Drift
+        id: drift
+        run: |
+          terraform plan -detailed-exitcode
+        working-directory: ./terraform
+        continue-on-error: true
+
+      - name: Create Issue on Drift
+        if: steps.drift.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Infrastructure Drift Detected',
+              body: 'Terraform has detected drift in the infrastructure. Please review and reconcile.\n\nWorkflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+              labels: ['infrastructure', 'drift', 'security']
+            })
+
+  cloud-posture-scan:
+    name: Cloud Security Posture Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Run AWS Security Checks
+        run: |
+          # Check for publicly accessible S3 buckets
+          echo "Checking S3 buckets..."
+          aws s3api list-buckets --query "Buckets[].Name" --output text | \
+          while read bucket; do
+            echo "Checking bucket: $bucket"
+            aws s3api get-bucket-acl --bucket $bucket 2>/dev/null || true
+          done
+
+      - name: Check for exposed MongoDB instances
+        run: |
+          # Check EC2 security groups for MongoDB port exposure
+          echo "Checking for exposed MongoDB instances..."
+          aws ec2 describe-security-groups --query "SecurityGroups[?IpPermissions[?FromPort==\`27017\` && ToPort==\`27017\`]].{GroupId:GroupId,GroupName:GroupName}" --output table
